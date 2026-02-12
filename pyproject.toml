@@ -3,7 +3,7 @@ requires = ["setuptools==70.0.0", "torch"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "Splatt3R-SLAM"
+name = "Spann3R-SLAM"
 version = "0.1.0"
 dependencies = [
     "numpy==1.26.4",
@@ -16,18 +16,16 @@ dependencies = [
     "opencv-python",
     "tqdm",
     "pyyaml",
-    # Splatt3r dependencies
-    "lightning",
-    "lpips",
-    "omegaconf",
-    "huggingface_hub",
-    "gitpython",
+    "scipy",
+    "roma==1.5.0",
+    "packaging",
+    "huggingface-hub[torch]>=0.24.6",
     # lietorch needs to be installed separately
     # "lietorch @ git+https://github.com/princeton-vl/lietorch.git",
     # "torchcodec==0.1",  # Optional
 ]
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["splatt3r_slam", "splatt3r_core"]
+where = [".", "spann3r_core"]
+include = ["spann3r_slam", "spann3r", "spann3r.*", "dust3r", "dust3r.*", "croco", "croco.*"]
 namespaces = false

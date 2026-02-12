@@ -10,11 +10,11 @@ has_cuda = torch.cuda.is_available()
 
 # Backend paths
 backend_dir = None
-if os.path.exists(os.path.join(ROOT, "splatt3r_slam/backend")):
-    backend_dir = "splatt3r_slam"
+if os.path.exists(os.path.join(ROOT, "spann3r_slam/backend")):
+    backend_dir = "spann3r_slam"
 
 if backend_dir is None:
-    print("Warning: No backend directory found in splatt3r_slam")
+    print("Warning: No backend directory found in spann3r_slam")
     ext_modules = []
 else:
     include_dirs = [

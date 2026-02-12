@@ -1,6 +1,5 @@
 """
-Main script for Splatt3R-SLAM
-This version uses Splatt3R (with Gaussian Splatting) instead of MASt3R.
+Main script for Spann3R-SLAM.
 """
 
 import argparse
@@ -25,28 +24,28 @@ warnings.filterwarnings(
 warnings.filterwarnings(
     "ignore", message=".*Arguments other than a weight enum.*", category=UserWarning
 )
-from splatt3r_slam.global_opt import FactorGraph
+from spann3r_slam.global_opt import FactorGraph
 
-from splatt3r_slam.config import load_config, config, set_global_config
-from splatt3r_slam.dataloader import Intrinsics, load_dataset
-import splatt3r_slam.evaluate as eval
-from splatt3r_slam.frame import (
+from spann3r_slam.config import load_config, config, set_global_config
+from spann3r_slam.dataloader import Intrinsics, load_dataset
+import spann3r_slam.evaluate as eval
+from spann3r_slam.frame import (
     Mode,
     SharedKeyframes,
     SharedStates,
     SharedGaussians,
     create_frame,
 )
-from splatt3r_slam.splatt3r_utils import (
-    load_splatt3r,
-    load_retriever,
-    splatt3r_inference_mono,
-    splatt3r_render,
+from spann3r_slam.spann3r_utils import (
+    load_spann3r,
+    load_spann3r_retriever,
+    spann3r_inference_mono,
+    spann3r_render,
     gaussians_to_world,
 )
-from splatt3r_slam.multiprocess_utils import new_queue, try_get_msg
-from splatt3r_slam.tracker import FrameTracker
-from splatt3r_slam.visualization import WindowMsg, run_visualization
+from spann3r_slam.multiprocess_utils import new_queue, try_get_msg
+from spann3r_slam.tracker import FrameTracker
+from spann3r_slam.visualization import WindowMsg, run_visualization
 import torch.multiprocessing as mp
 
 
@@ -101,7 +100,7 @@ def run_backend(cfg, model, states, keyframes, K):
 
     device = keyframes.device
     factor_graph = FactorGraph(model, keyframes, K, device)
-    retrieval_database = load_retriever(model)
+    retrieval_database = load_spann3r_retriever(model)
 
     mode = states.get_mode()
     while mode is not Mode.TERMINATED:
@@ -176,21 +175,26 @@ if __name__ == "__main__":
     datetime_now = str(datetime.datetime.now()).replace(" ", "_")
 
     parser = argparse.ArgumentParser()
-    parser.add_argument("--dataset", default="datasets/tum/rgbd_dataset_freiburg1_desk")
+    parser.add_argument("--dataset", default="datasets/examples/s00567")
     parser.add_argument("--config", default="config/base.yaml")
     parser.add_argument("--save-as", default="default")
     parser.add_argument("--no-viz", action="store_true")
     parser.add_argument("--calib", default="")
     parser.add_argument(
         "--checkpoint",
-        default=None,
-        help="Path to Splatt3R checkpoint (downloads if not provided)",
+        default="checkpoints/spann3r.pth",
+        help="Path to Spann3R checkpoint (default: checkpoints/spann3r.pth)",
+    )
+    parser.add_argument(
+        "--dust3r-checkpoint",
+        default="checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth",
+        help="Path to DUSt3R checkpoint (default: checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth)",
     )
     parser.add_argument(
         "--render-gaussians",
         action="store_true",
-        default=True,
-        help="Enable Gaussian Splatting rendering and save per-frame PNGs (default: True)",
+        default=False,
+        help="Reserved flag. Spann3R mode currently does not output Gaussian parameters.",
     )
     parser.add_argument(
         "--no-render-gaussians",
@@ -243,7 +247,8 @@ if __name__ == "__main__":
 
     keyframes = SharedKeyframes(manager, h, w)
     states = SharedStates(manager, h, w)
-    shared_gaussians = SharedGaussians(manager, max_gaussians=args.max_gaussians)
+    # Spann3R mode does not currently push Gaussian primitives to this buffer.
+    shared_gaussians = SharedGaussians(manager, max_gaussians=1)
 
     if not args.no_viz:
         viz = mp.Process(
@@ -252,9 +257,13 @@ if __name__ == "__main__":
         )
         viz.start()
 
-    # Load Splatt3R model instead of MASt3R
-    print("Loading Splatt3R model...")
-    model = load_splatt3r(path=args.checkpoint, device=device)
+    # Load Spann3R model
+    print("Loading Spann3R model...")
+    model = load_spann3r(
+        path=args.checkpoint,
+        device=device,
+        dust3r_path=args.dust3r_checkpoint,
+    )
     model.share_memory()
 
     has_calib = dataset.has_calib()
@@ -284,19 +293,24 @@ if __name__ == "__main__":
     last_msg = WindowMsg()
 
     # Gaussian rendering setup
-    render_gaussians = args.render_gaussians and not args.no_render_gaussians
+    requested_render_gaussians = args.render_gaussians and not args.no_render_gaussians
+    if requested_render_gaussians:
+        print(
+            "[Warning] Gaussian rendering is unavailable in Spann3R mode. "
+            "Disabling render-gaussians."
+        )
+    render_gaussians = False
     spatial_stride = args.spatial_stride
     render_dir = None
     if render_gaussians:
         render_dir = pathlib.Path(args.render_dir)
         render_dir.mkdir(exist_ok=True, parents=True)
         print(f"[Gaussian Rendering] Enabled. Saving to {render_dir}")
-    print(
-        f"[Gaussians] max_gaussians={args.max_gaussians}, spatial_stride={spatial_stride}"
-    )
+    else:
+        print("[Gaussians] Disabled in Spann3R mode.")
 
-    # Enable gaussian splatting visualization whenever the viz window is active
-    enable_gs_viz = not args.no_viz
+    # Spann3R path currently does not provide Gaussian parameters for this renderer.
+    enable_gs_viz = False
 
     backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
     backend.start()
@@ -339,8 +353,8 @@ if __name__ == "__main__":
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
 
         if mode == Mode.INIT:
-            # Initialize via mono inference with Splatt3R
-            X_init, C_init = splatt3r_inference_mono(model, frame)
+            # Initialize via mono inference with Spann3R
+            X_init, C_init = spann3r_inference_mono(model, frame)
             frame.update_pointmap(X_init, C_init)
             keyframes.append(frame)
             states.queue_global_optimization(len(keyframes) - 1)
@@ -364,7 +378,7 @@ if __name__ == "__main__":
                             opacity_threshold=0.3,
                         )
                     if render_gaussians:
-                        rendered = splatt3r_render(model, frame, frame, K=K)
+                        rendered = spann3r_render(model, frame, frame, K=K)
                         if rendered is not None:
                             rendered_img = (
                                 rendered[0, 0].cpu().clamp(0, 1).permute(1, 2, 0)
@@ -403,7 +417,7 @@ if __name__ == "__main__":
             if render_gaussians and not try_reloc:
                 keyframe = keyframes.last_keyframe()
                 if keyframe is not None:
-                    rendered = splatt3r_render(
+                    rendered = spann3r_render(
                         model,
                         frame,
                         keyframe,
@@ -419,7 +433,7 @@ if __name__ == "__main__":
                         )
 
         elif mode == Mode.RELOC:
-            X, C = splatt3r_inference_mono(model, frame)
+            X, C = spann3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
             states.set_frame(frame)
             states.queue_reloc()
