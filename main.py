@@ -33,7 +33,6 @@ from spann3r_slam.frame import (
     Mode,
     SharedKeyframes,
     SharedStates,
-    SharedGaussians,
     create_frame,
 )
 from spann3r_slam.spann3r_utils import (
@@ -200,11 +199,6 @@ if __name__ == "__main__":
         help="Path to DUSt3R checkpoint (default: checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth)",
     )
     parser.add_argument(
-        "--render-gaussians",
-        action="store_true",
-        help="Enable Spann3R backend rendering (deprecated alias, enabled by default).",
-    )
-    parser.add_argument(
         "--no-render-gaussians",
         action="store_true",
         help="Disable Spann3R backend rendering and per-frame PNG saving",
@@ -255,8 +249,6 @@ if __name__ == "__main__":
 
     keyframes = SharedKeyframes(manager, h, w)
     states = SharedStates(manager, h, w)
-    # Spann3R mode does not currently push Gaussian primitives to this buffer.
-    shared_gaussians = SharedGaussians(manager, max_gaussians=1)
 
     if not args.no_viz:
         viz = mp.Process(
@@ -265,7 +257,6 @@ if __name__ == "__main__":
                 config,
                 states,
                 keyframes,
-                shared_gaussians,
                 main2viz,
                 viz2main,
                 args.spatial_stride,

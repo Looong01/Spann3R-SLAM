@@ -50,7 +50,6 @@ class Window(WindowEvents):
         self,
         states,
         keyframes,
-        shared_gaussians,
         main2viz,
         viz2main,
         init_spatial_stride=4,
@@ -86,7 +85,6 @@ class Window(WindowEvents):
         self.state.max_gaussians = max(20000, int(init_max_gaussians))
         self.states = states
         self.keyframes = keyframes
-        self.shared_gaussians = shared_gaussians
         self.main2viz = main2viz
         self.viz2main = viz2main
 
@@ -558,7 +556,6 @@ def run_visualization(
     cfg,
     states,
     keyframes,
-    shared_gaussians,
     main2viz,
     viz2main,
     init_spatial_stride=4,
@@ -590,7 +587,6 @@ def run_visualization(
     window_config = config_cls(
         states=states,
         keyframes=keyframes,
-        shared_gaussians=shared_gaussians,
         main2viz=main2viz,
         viz2main=viz2main,
         init_spatial_stride=init_spatial_stride,

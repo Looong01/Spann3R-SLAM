@@ -170,12 +170,6 @@ def downsample(X, C, D, Q):
     return X, C, D, Q
 
 
-@torch.inference_mode()
-def gaussians_to_world(frame, include_cross=True, spatial_stride=1):
-    _ = (frame, include_cross, spatial_stride)
-    return None
-
-
 def _default_intrinsics(h, w, device, dtype):
     # 60 deg default field of view for unknown intrinsics.
     focal = 0.5 * max(h, w) / np.tan(np.deg2rad(60.0 / 2.0))

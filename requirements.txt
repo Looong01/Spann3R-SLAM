@@ -23,7 +23,6 @@ huggingface-hub[torch]>=0.24.6
 matplotlib
 trimesh
 open3d
-gdown
 imageio[ffmpeg]
 gradio==4.43.0
 
