@@ -12,6 +12,7 @@ import einops
 import numpy as np
 import torch
 import torch.nn.functional as F
+import lietorch
 
 # Add Spann3R source tree first so ``import dust3r`` / ``import spann3r``
 # resolve to the upstream code copied into this repository.
@@ -175,10 +176,178 @@ def gaussians_to_world(frame, include_cross=True, spatial_stride=1):
     return None
 
 
+def _default_intrinsics(h, w, device, dtype):
+    # 60 deg default field of view for unknown intrinsics.
+    focal = 0.5 * max(h, w) / np.tan(np.deg2rad(60.0 / 2.0))
+    return torch.tensor(
+        [[focal, 0.0, (w - 1) * 0.5], [0.0, focal, (h - 1) * 0.5], [0.0, 0.0, 1.0]],
+        device=device,
+        dtype=dtype,
+    )
+
+
+def _as_se3_pose(T):
+    """Convert a Sim3 pose to SE3 by dropping the scale component."""
+    if isinstance(T, lietorch.SE3):
+        return T
+    if isinstance(T, lietorch.Sim3):
+        return lietorch.SE3(T.data[..., :7])
+    return T
+
+
+def _subsample_points(points, colors, max_points=None):
+    if points is None or colors is None:
+        return None, None
+    if max_points is None or max_points <= 0 or points.shape[0] <= max_points:
+        return points, colors
+
+    step = int(np.ceil(points.shape[0] / float(max_points)))
+    return points[::step], colors[::step]
+
+
+def _collect_world_points(frame, conf_thresh, spatial_stride=1, max_points=None):
+    if frame is None or frame.X_canon is None:
+        return None, None
+
+    X = frame.X_canon
+    if X.ndim == 3:
+        X = X.squeeze(0)
+    if X.numel() == 0:
+        return None, None
+
+    C = None
+    if getattr(frame, "C", None) is not None:
+        N = int(getattr(frame, "N", 0))
+        if N > 0:
+            C = frame.get_average_conf()
+        else:
+            C = frame.C
+    if C is None:
+        C = torch.ones(X.shape[0], 1, device=X.device, dtype=X.dtype)
+    if C.ndim == 3:
+        C = C.squeeze(0)
+
+    rgb = frame.uimg.to(device=X.device, dtype=X.dtype).view(-1, 3)
+    valid = torch.isfinite(X).all(dim=-1) & torch.isfinite(C[:, 0]) & (X[:, 2] > 1e-6)
+    valid = valid & (C[:, 0] > conf_thresh)
+    if valid.sum() == 0:
+        return None, None
+
+    idx = torch.where(valid)[0]
+    if spatial_stride is not None and spatial_stride > 1:
+        idx = idx[:: int(spatial_stride)]
+    if idx.numel() == 0:
+        return None, None
+
+    T_WC = _as_se3_pose(frame.T_WC)
+    Xw = T_WC.act(X[idx])
+    rgb = rgb[idx]
+    return _subsample_points(Xw, rgb, max_points=max_points)
+
+
 @torch.inference_mode()
-def spann3r_render(model, frame, ref_frame, K=None, target_T_WC=None):
-    _ = (model, frame, ref_frame, K, target_T_WC)
-    return None
+def spann3r_collect_world_points(
+    frames, conf_thresh=0.0, spatial_stride=1, max_points=None
+):
+    frames = list(frames)
+    per_frame_cap = None
+    if max_points is not None and max_points > 0 and len(frames) > 0:
+        per_frame_cap = max(1, int(np.ceil(float(max_points) / float(len(frames)))))
+
+    world_pts = []
+    world_rgb = []
+    for frame in frames:
+        Xw, rgb = _collect_world_points(
+            frame,
+            conf_thresh=conf_thresh,
+            spatial_stride=spatial_stride,
+            max_points=per_frame_cap,
+        )
+        if Xw is not None:
+            world_pts.append(Xw)
+            world_rgb.append(rgb)
+
+    if not world_pts:
+        return None, None
+
+    Xw = torch.cat(world_pts, dim=0)
+    rgb = torch.cat(world_rgb, dim=0)
+    return _subsample_points(Xw, rgb, max_points=max_points)
+
+
+def _zbuffer_rasterize(points_cam, colors, K, h, w):
+    if points_cam is None or points_cam.numel() == 0:
+        return np.zeros((h, w, 3), dtype=np.float32)
+
+    x, y, z = points_cam.unbind(dim=-1)
+    fx, fy = K[0, 0], K[1, 1]
+    cx, cy = K[0, 2], K[1, 2]
+
+    u = torch.round(fx * (x / z) + cx).long()
+    v = torch.round(fy * (y / z) + cy).long()
+    valid = (z > 1e-6) & (u >= 0) & (u < w) & (v >= 0) & (v < h)
+    if valid.sum() == 0:
+        return np.zeros((h, w, 3), dtype=np.float32)
+
+    u = u[valid].detach().cpu().numpy().astype(np.int64)
+    v = v[valid].detach().cpu().numpy().astype(np.int64)
+    z = z[valid].detach().cpu().numpy().astype(np.float32)
+    c = colors[valid].detach().cpu().numpy().astype(np.float32)
+
+    pix = v * w + u
+    # For each pixel keep the nearest point.
+    order = np.lexsort((z, pix))
+    pix_sorted = pix[order]
+    col_sorted = c[order]
+    unique_pix, first_idx = np.unique(pix_sorted, return_index=True)
+
+    img = np.zeros((h * w, 3), dtype=np.float32)
+    img[unique_pix] = col_sorted[first_idx]
+    return img.reshape(h, w, 3)
+
+
+@torch.inference_mode()
+def spann3r_render(
+    model,
+    frame,
+    ref_frame,
+    K=None,
+    target_T_WC=None,
+    spatial_stride=1,
+    max_points=None,
+):
+    _ = model
+    if frame is None or frame.X_canon is None:
+        return None
+
+    h, w = map(int, frame.img_shape.flatten().tolist())
+    device = frame.X_canon.device
+    dtype = frame.X_canon.dtype
+    K_use = K if K is not None else _default_intrinsics(h, w, device, dtype)
+    target_T_WC = target_T_WC if target_T_WC is not None else frame.T_WC
+    target_T_WC = _as_se3_pose(target_T_WC)
+    target_T_CW = target_T_WC.inv()
+
+    conf_thresh = float(config["tracking"].get("C_conf", 0.0))
+    Xw, rgb = spann3r_collect_world_points(
+        (frame, ref_frame),
+        conf_thresh=conf_thresh,
+        spatial_stride=spatial_stride,
+        max_points=max_points,
+    )
+    if Xw is None:
+        return None
+    Xc = target_T_CW.act(Xw)
+
+    rendered = _zbuffer_rasterize(Xc, rgb, K_use, h, w)
+    out = (
+        torch.from_numpy(rendered)
+        .to(device=device, dtype=torch.float32)
+        .permute(2, 0, 1)
+        .unsqueeze(0)
+        .unsqueeze(0)
+    )
+    return out.clamp(0.0, 1.0)
 
 
 @torch.inference_mode()

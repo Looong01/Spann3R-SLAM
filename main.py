@@ -41,7 +41,6 @@ from spann3r_slam.spann3r_utils import (
     load_spann3r_retriever,
     spann3r_inference_mono,
     spann3r_render,
-    gaussians_to_world,
 )
 from spann3r_slam.multiprocess_utils import new_queue, try_get_msg
 from spann3r_slam.tracker import FrameTracker
@@ -95,10 +94,20 @@ def relocalization(frame, keyframes, factor_graph, retrieval_database):
         return successful_loop_closure
 
 
-def run_backend(cfg, model, states, keyframes, K):
+def run_backend(
+    cfg, states, keyframes, K, checkpoint_path, dust3r_checkpoint_path, device
+):
     set_global_config(cfg)
 
-    device = keyframes.device
+    print("[Backend] Loading Spann3R model in backend process...")
+    model = load_spann3r(
+        path=checkpoint_path,
+        device=device,
+        dust3r_path=dust3r_checkpoint_path,
+    )
+    if K is not None:
+        K = K.to(device=device, dtype=torch.float32)
+
     factor_graph = FactorGraph(model, keyframes, K, device)
     retrieval_database = load_spann3r_retriever(model)
 
@@ -193,24 +202,23 @@ if __name__ == "__main__":
     parser.add_argument(
         "--render-gaussians",
         action="store_true",
-        default=False,
-        help="Reserved flag. Spann3R mode currently does not output Gaussian parameters.",
+        help="Enable Spann3R backend rendering (deprecated alias, enabled by default).",
     )
     parser.add_argument(
         "--no-render-gaussians",
         action="store_true",
-        help="Disable Gaussian Splatting rendering and per-frame PNG saving",
+        help="Disable Spann3R backend rendering and per-frame PNG saving",
     )
     parser.add_argument(
         "--render-dir",
-        default="logs/gaussian_renders",
-        help="Directory to save Gaussian-rendered images (default: logs/gaussian_renders)",
+        default="logs/spann3r_renders",
+        help="Directory to save Spann3R-rendered images (default: logs/spann3r_renders)",
     )
     parser.add_argument(
         "--max-gaussians",
         type=int,
         default=4 * 1024 * 1024,
-        help="Max number of Gaussians in shared buffer (default: 4194304)",
+        help="Max number of points/gaussians used by Spann3R renderer (default: 4194304)",
     )
     parser.add_argument(
         "--spatial-stride",
@@ -253,7 +261,16 @@ if __name__ == "__main__":
     if not args.no_viz:
         viz = mp.Process(
             target=run_visualization,
-            args=(config, states, keyframes, shared_gaussians, main2viz, viz2main),
+            args=(
+                config,
+                states,
+                keyframes,
+                shared_gaussians,
+                main2viz,
+                viz2main,
+                args.spatial_stride,
+                args.max_gaussians,
+            ),
         )
         viz.start()
 
@@ -264,8 +281,6 @@ if __name__ == "__main__":
         device=device,
         dust3r_path=args.dust3r_checkpoint,
     )
-    model.share_memory()
-
     has_calib = dataset.has_calib()
     use_calib = config["use_calib"]
 
@@ -278,6 +293,7 @@ if __name__ == "__main__":
             device, dtype=torch.float32
         )
         keyframes.set_intrinsics(K)
+    K_backend = K.detach().cpu() if K is not None else None
 
     # remove the trajectory from the previous run
     if dataset.save_results:
@@ -290,30 +306,56 @@ if __name__ == "__main__":
             recon_file.unlink()
 
     tracker = FrameTracker(model, keyframes, device)
-    last_msg = WindowMsg()
 
-    # Gaussian rendering setup
-    requested_render_gaussians = args.render_gaussians and not args.no_render_gaussians
-    if requested_render_gaussians:
-        print(
-            "[Warning] Gaussian rendering is unavailable in Spann3R mode. "
-            "Disabling render-gaussians."
-        )
-    render_gaussians = False
+    # Spann3R rendering setup
+    render_gaussians = not args.no_render_gaussians
     spatial_stride = args.spatial_stride
+    max_gaussians = args.max_gaussians
+    last_msg = WindowMsg(spatial_stride=spatial_stride, max_gaussians=max_gaussians)
     render_dir = None
     if render_gaussians:
         render_dir = pathlib.Path(args.render_dir)
         render_dir.mkdir(exist_ok=True, parents=True)
-        print(f"[Gaussian Rendering] Enabled. Saving to {render_dir}")
+        print(f"[Spann3R Rendering] Enabled. Saving to {render_dir}")
     else:
-        print("[Gaussians] Disabled in Spann3R mode.")
+        print("[Spann3R Rendering] Disabled.")
 
-    # Spann3R path currently does not provide Gaussian parameters for this renderer.
-    enable_gs_viz = False
-
-    backend = mp.Process(target=run_backend, args=(config, model, states, keyframes, K))
+    backend = mp.Process(
+        target=run_backend,
+        args=(
+            config,
+            states,
+            keyframes,
+            K_backend,
+            args.checkpoint,
+            args.dust3r_checkpoint,
+            device,
+        ),
+    )
     backend.start()
+
+    def render_and_save_frame(src_frame, ref_frame, frame_idx):
+        if not render_gaussians:
+            return
+        stride = max(1, int(last_msg.spatial_stride))
+        max_points = max(20000, int(last_msg.max_gaussians))
+
+        rendered = spann3r_render(
+            model,
+            src_frame,
+            ref_frame,
+            K=K,
+            target_T_WC=src_frame.T_WC,
+            spatial_stride=stride,
+            max_points=max_points,
+        )
+        if rendered is None:
+            return
+
+        rendered_img = rendered[0, 0].detach().cpu().clamp(0, 1).permute(1, 2, 0)
+        rendered_np = (rendered_img.numpy() * 255).astype("uint8")
+        rendered_bgr = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR)
+        cv2.imwrite(str(render_dir / f"spann3r_{frame_idx:06d}.png"), rendered_bgr)
 
     i = 0
     fps_timer = time.time()
@@ -351,6 +393,7 @@ if __name__ == "__main__":
             else states.get_frame().T_WC
         )
         frame = create_frame(i, img, T_WC, img_size=dataset.img_size, device=device)
+        add_new_kf = False
 
         if mode == Mode.INIT:
             # Initialize via mono inference with Spann3R
@@ -360,34 +403,7 @@ if __name__ == "__main__":
             states.queue_global_optimization(len(keyframes) - 1)
             states.set_mode(Mode.TRACKING)
             states.set_frame(frame)
-
-            # --- Gaussian Splatting: accumulate world-space Gaussians ---
-            if enable_gs_viz or render_gaussians:
-                gs_world = gaussians_to_world(
-                    frame, include_cross=False, spatial_stride=spatial_stride
-                )
-                if gs_world is not None:
-                    means_w, cov_w, colors_w, opas_w = gs_world
-                    if enable_gs_viz:
-                        shared_gaussians.append(
-                            means_w,
-                            cov_w,
-                            colors_w,
-                            opas_w,
-                            kf_idx=len(keyframes) - 1,
-                            opacity_threshold=0.3,
-                        )
-                    if render_gaussians:
-                        rendered = spann3r_render(model, frame, frame, K=K)
-                        if rendered is not None:
-                            rendered_img = (
-                                rendered[0, 0].cpu().clamp(0, 1).permute(1, 2, 0)
-                            )
-                            rendered_np = (rendered_img.numpy() * 255).astype("uint8")
-                            rendered_bgr = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR)
-                            cv2.imwrite(
-                                str(render_dir / f"gs_init_{i:06d}.png"), rendered_bgr
-                            )
+            render_and_save_frame(frame, frame, i)
 
             i += 1
             continue
@@ -397,45 +413,17 @@ if __name__ == "__main__":
             if try_reloc:
                 states.set_mode(Mode.RELOC)
             states.set_frame(frame)
-
-            # --- Gaussian Splatting: accumulate world-space Gaussians every tracked frame ---
-            if (enable_gs_viz or render_gaussians) and not try_reloc:
-                gs_world = gaussians_to_world(
-                    frame, include_cross=False, spatial_stride=spatial_stride
-                )
-                if gs_world is not None:
-                    means_w, cov_w, colors_w, opas_w = gs_world
-                    if enable_gs_viz:
-                        shared_gaussians.append(
-                            means_w,
-                            cov_w,
-                            colors_w,
-                            opas_w,
-                            kf_idx=len(keyframes),
-                            opacity_threshold=0.3,
-                        )
-            if render_gaussians and not try_reloc:
+            if not try_reloc:
                 keyframe = keyframes.last_keyframe()
-                if keyframe is not None:
-                    rendered = spann3r_render(
-                        model,
-                        frame,
-                        keyframe,
-                        K=K,
-                        target_T_WC=frame.T_WC,
-                    )
-                    if rendered is not None:
-                        rendered_img = rendered[0, 0].cpu().clamp(0, 1).permute(1, 2, 0)
-                        rendered_np = (rendered_img.numpy() * 255).astype("uint8")
-                        rendered_bgr = cv2.cvtColor(rendered_np, cv2.COLOR_RGB2BGR)
-                        cv2.imwrite(
-                            str(render_dir / f"gs_track_{i:06d}.png"), rendered_bgr
-                        )
+                if keyframe is None:
+                    keyframe = frame
+                render_and_save_frame(frame, keyframe, i)
 
         elif mode == Mode.RELOC:
             X, C = spann3r_inference_mono(model, frame)
             frame.update_pointmap(X, C)
             states.set_frame(frame)
+            render_and_save_frame(frame, frame, i)
             states.queue_reloc()
             # In single threaded mode, make sure relocalization happen for every frame
             while config["single_thread"]:
