@@ -134,7 +134,11 @@ def load_spann3r(path=None, device="cuda", dust3r_path=None):
 
     print(f"Loading Spann3R weights from {spann3r_ckpt}")
     checkpoint = torch.load(spann3r_ckpt, map_location="cpu")
-    state_dict = checkpoint["model"] if isinstance(checkpoint, dict) and "model" in checkpoint else checkpoint
+    state_dict = (
+        checkpoint["model"]
+        if isinstance(checkpoint, dict) and "model" in checkpoint
+        else checkpoint
+    )
     msg = model.load_state_dict(state_dict, strict=False)
     if msg.missing_keys:
         print(f"[Spann3R] Missing keys: {len(msg.missing_keys)}")
@@ -154,7 +158,7 @@ def load_spann3r_retriever(spann3r_model, retriever_path=None, device="cuda"):
 @torch.inference_mode()
 def decoder(model, feat1, feat2, pos1, pos2, shape1, shape2):
     dec1, dec2 = model.decode(feat1, pos1, feat2, pos2)
-    with torch.cuda.amp.autocast(enabled=False):
+    with torch.amp.autocast("cuda", enabled=False):
         res1 = model.downstream_head(dec1, shape1, 1)
         res2 = model.downstream_head(dec2, shape2, 2)
     return res1, res2
@@ -380,7 +384,9 @@ def spann3r_decode_symmetric_batch(
         res11, res21 = decoder(model, feat1, feat2, pos1, pos2, shape_i[b], shape_j[b])
         res22, res12 = decoder(model, feat2, feat1, pos2, pos1, shape_j[b], shape_i[b])
 
-        Xb, Cb, Db, Qb = zip(*[_extract_outputs(r) for r in [res11, res21, res22, res12]])
+        Xb, Cb, Db, Qb = zip(
+            *[_extract_outputs(r) for r in [res11, res21, res22, res12]]
+        )
         X.append(torch.stack(Xb, dim=0))
         C.append(torch.stack(Cb, dim=0))
         D.append(torch.stack(Db, dim=0))
