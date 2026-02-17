@@ -211,14 +211,14 @@ if __name__ == "__main__":
     parser.add_argument(
         "--max-gaussians",
         type=int,
-        default=4 * 1024 * 1024,
-        help="Max number of points/gaussians used by Spann3R renderer (default: 4194304)",
+        default=6 * 1024 * 1024,
+        help="Max number of points/gaussians used by Spann3R renderer (default: 6291456)",
     )
     parser.add_argument(
         "--spatial-stride",
         type=int,
-        default=4,
-        help="Spatial stride for subsampling Gaussians per frame (default: 4, stride=1 means no subsampling)",
+        default=1,
+        help="Spatial stride for subsampling Gaussians per frame (default: 1, stride=1 means no subsampling)",
     )
 
     args = parser.parse_args()

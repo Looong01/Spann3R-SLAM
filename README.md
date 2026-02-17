@@ -163,8 +163,8 @@ python main.py --no-viz
 | `--dust3r-checkpoint` | `checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth` | DUSt3R checkpoint path |
 | `--no-render-gaussians` | off | Disable Spann3R rendering and per-frame PNG export |
 | `--render-dir` | `logs/spann3r_renders` | Directory for rendered PNGs |
-| `--max-gaussians` | `4194304` | Max active points used by renderer |
-| `--spatial-stride` | `4` | Per-frame point subsampling stride (`1` = no subsampling) |
+| `--max-gaussians` | `6291456` | Max active points used by renderer |
+| `--spatial-stride` | `1` | Per-frame point subsampling stride (`1` = no subsampling) |
 
 ### GUI Controls (Interactive Viz)
 
@@ -176,11 +176,14 @@ When GUI is enabled, the left panel exposes runtime controls:
 | `C_conf_threshold` | `0.0 .. 5.0` (init from config) | Confidence filtering for rendered/visualized points |
 | `follow cam` | bool (on) | Viewer follows current camera |
 | `spann3r_rendering` | bool (on) | Toggle Spann3R reprojection rendering layer |
-| `render_res_scale` | `0.2 .. 1.0` (default `0.5`) | Viewport rendering resolution scale |
+| `render_res_scale` | `0.2 .. 2.0` (default `1.2`) | Viewport rendering resolution scale (`>1.0` = supersampling) |
 | `spatial_stride` | `1 .. 16` (init from CLI) | Point density control |
 | `max_gaussians` | `20000 .. dynamic upper bound` (init from CLI) | Active point cap |
-| `render_point_radius` | `0 .. 2` (default `1`) | Point splat radius in pixels |
+| `render_point_radius` | `0 .. 4` (default `1`) | Point splat radius in pixels |
 | `cache_refresh` | `1 .. 30` (default `1`) | Refresh interval of current-frame cache |
+| `map_voxel_size` | `0.005 .. 0.10` (default `0.008`) | Stable-map voxel fusion size (larger = stronger de-duplication) |
+| `kf_min_support` | `1 .. 8` (default `2`) | Minimum voxel support count to keep stable-map points |
+| `recent_keep` | `1 .. 12` (default `4`) | Number of latest raw frame clouds kept for high local detail |
 | `show_keyframe_edges` / `show_keyframe` / `show_axis` | bool | Overlay debug visuals |
 | `line_thickness` / `frustum_scale` | drag | Frustum/edge drawing style |
 

@@ -35,11 +35,14 @@ class WindowMsg:
     is_paused: bool = False
     next: bool = False
     C_conf_threshold: float = 0.0
-    render_resolution_scale: float = 0.5
-    spatial_stride: int = 4
-    max_gaussians: int = 4 * 1024 * 1024
+    render_resolution_scale: float = 1.2
+    spatial_stride: int = 1
+    max_gaussians: int = 6 * 1024 * 1024
     render_point_radius: int = 1
     render_refresh_interval: int = 1
+    map_voxel_size: float = 0.008
+    kf_min_support: int = 2
+    recent_frame_keep: int = 4
 
 
 class Window(WindowEvents):
@@ -52,8 +55,8 @@ class Window(WindowEvents):
         keyframes,
         main2viz,
         viz2main,
-        init_spatial_stride=4,
-        init_max_gaussians=4 * 1024 * 1024,
+        init_spatial_stride=1,
+        init_max_gaussians=6 * 1024 * 1024,
         **kwargs,
     ):
         super().__init__(**kwargs)
@@ -131,11 +134,14 @@ class Window(WindowEvents):
         # Persistent world cloud cache to avoid losing geometry outside the latest view.
         self._kf_points = np.zeros((0, 3), dtype=np.float32)
         self._kf_colors = np.zeros((0, 3), dtype=np.float32)
+        self._kf_weights = np.zeros((0,), dtype=np.float32)
         self._curr_points = np.zeros((0, 3), dtype=np.float32)
         self._curr_colors = np.zeros((0, 3), dtype=np.float32)
         self._cached_kf_count = 0
         self._cache_signature = None
+        self._last_fused_frame_id = -1
         self._last_curr_frame_id = -1
+        self._recent_clouds = []
         self._render_counter = 0
         self._active_render_points = 0
         self._offset_cache = {0: np.array([[0, 0]], dtype=np.int32)}
@@ -270,7 +276,7 @@ class Window(WindowEvents):
         imgui.spacing()
         imgui.text("Render Tuning")
         _, new_state.render_resolution_scale = imgui.slider_float(
-            "render_res_scale", self.state.render_resolution_scale, 0.2, 1.0
+            "render_res_scale", self.state.render_resolution_scale, 0.2, 2.0
         )
         _, new_state.spatial_stride = imgui.slider_int(
             "spatial_stride", self.state.spatial_stride, 1, 16
@@ -280,10 +286,19 @@ class Window(WindowEvents):
             "max_gaussians", self.state.max_gaussians, 20000, max_slider
         )
         _, new_state.render_point_radius = imgui.slider_int(
-            "render_point_radius", self.state.render_point_radius, 0, 2
+            "render_point_radius", self.state.render_point_radius, 0, 4
         )
         _, new_state.render_refresh_interval = imgui.slider_int(
             "cache_refresh", self.state.render_refresh_interval, 1, 30
+        )
+        _, new_state.map_voxel_size = imgui.slider_float(
+            "map_voxel_size", self.state.map_voxel_size, 0.005, 0.10
+        )
+        _, new_state.kf_min_support = imgui.slider_int(
+            "kf_min_support", self.state.kf_min_support, 1, 8
+        )
+        _, new_state.recent_frame_keep = imgui.slider_int(
+            "recent_keep", self.state.recent_frame_keep, 1, 12
         )
 
         imgui.text(f"active points: {self._active_render_points}")
@@ -330,15 +345,21 @@ class Window(WindowEvents):
             float(self.state.C_conf_threshold),
             int(self.state.spatial_stride),
             int(self.state.max_gaussians),
+            float(self.state.map_voxel_size),
+            int(self.state.kf_min_support),
+            int(self.state.recent_frame_keep),
         )
 
     def _reset_cloud_cache(self):
         self._kf_points = np.zeros((0, 3), dtype=np.float32)
         self._kf_colors = np.zeros((0, 3), dtype=np.float32)
+        self._kf_weights = np.zeros((0,), dtype=np.float32)
         self._curr_points = np.zeros((0, 3), dtype=np.float32)
         self._curr_colors = np.zeros((0, 3), dtype=np.float32)
         self._cached_kf_count = 0
+        self._last_fused_frame_id = -1
         self._last_curr_frame_id = -1
+        self._recent_clouds = []
 
     def _frame_world_cloud_np(self, frame):
         pts, rgb = spann3r_collect_world_points(
@@ -355,26 +376,91 @@ class Window(WindowEvents):
         )
 
     @staticmethod
-    def _cap_cloud_np(points, colors, max_points):
+    def _cap_cloud_np(points, colors, max_points, weights=None):
         if points.shape[0] <= max_points:
-            return points, colors
-        idx = np.linspace(0, points.shape[0] - 1, num=max_points, dtype=np.int64)
-        return points[idx], colors[idx]
+            return points, colors, weights
+
+        if weights is None:
+            idx = np.linspace(0, points.shape[0] - 1, num=max_points, dtype=np.int64)
+        else:
+            idx = np.argsort(weights)[-max_points:]
+        points = points[idx]
+        colors = colors[idx]
+        if weights is not None:
+            weights = weights[idx]
+        return points, colors, weights
+
+    @staticmethod
+    def _voxel_fuse_np(points, colors, weights, voxel_size):
+        if points.shape[0] == 0:
+            return points, colors, weights
+
+        voxel = max(1e-4, float(voxel_size))
+        keys = np.floor(points / voxel).astype(np.int32)
+        key_view = np.ascontiguousarray(keys).view(
+            np.dtype((np.void, keys.dtype.itemsize * keys.shape[1]))
+        ).reshape(-1)
+        _, inv = np.unique(key_view, return_inverse=True)
+
+        n_vox = int(inv.max()) + 1
+        sum_w = np.bincount(inv, weights=weights, minlength=n_vox).astype(np.float32)
+        sum_w_safe = np.maximum(sum_w, 1e-6)
+
+        pts_sum = np.stack(
+            [
+                np.bincount(inv, weights=points[:, i] * weights, minlength=n_vox)
+                for i in range(3)
+            ],
+            axis=1,
+        ).astype(np.float32)
+        fused_points = pts_sum / sum_w_safe[:, None]
+        # Preserve high-frequency appearance by keeping the most recent color
+        # sample per voxel instead of averaging all colors.
+        last_idx = np.zeros((n_vox,), dtype=np.int64)
+        last_idx[inv] = np.arange(inv.shape[0], dtype=np.int64)
+        fused_colors = colors[last_idx]
+        return fused_points, fused_colors, sum_w
 
     def _append_to_kf_cache(self, points, colors):
         if points is None or points.shape[0] == 0:
             return
-        if self._kf_points.shape[0] == 0:
-            self._kf_points = points
-            self._kf_colors = colors
-        else:
-            self._kf_points = np.concatenate([self._kf_points, points], axis=0)
-            self._kf_colors = np.concatenate([self._kf_colors, colors], axis=0)
 
         max_points = max(20000, int(self.state.max_gaussians))
-        self._kf_points, self._kf_colors = self._cap_cloud_np(
-            self._kf_points, self._kf_colors, max_points
+        voxel_size = max(0.005, float(self.state.map_voxel_size))
+
+        new_weights = np.ones((points.shape[0],), dtype=np.float32)
+        if self._kf_points.shape[0] == 0:
+            cat_points = points
+            cat_colors = colors
+            cat_weights = new_weights
+        else:
+            cat_points = np.concatenate([self._kf_points, points], axis=0)
+            cat_colors = np.concatenate([self._kf_colors, colors], axis=0)
+            cat_weights = np.concatenate([self._kf_weights, new_weights], axis=0)
+
+        fused_p, fused_c, fused_w = self._voxel_fuse_np(
+            cat_points,
+            cat_colors,
+            cat_weights,
+            voxel_size=voxel_size,
         )
+
+        self._kf_points, self._kf_colors, self._kf_weights = self._cap_cloud_np(
+            fused_p, fused_c, max_points, fused_w
+        )
+
+    def _push_recent_cloud(self, frame_id, points, colors):
+        if points is None or points.shape[0] == 0:
+            return
+        fid = int(frame_id)
+        if self._recent_clouds and self._recent_clouds[-1][0] == fid:
+            self._recent_clouds[-1] = (fid, points, colors)
+        else:
+            self._recent_clouds.append((fid, points, colors))
+
+        keep = max(1, int(self.state.recent_frame_keep))
+        if len(self._recent_clouds) > keep:
+            self._recent_clouds = self._recent_clouds[-keep:]
 
     def _update_world_cloud_cache(self, curr_frame, n_keyframes):
         signature = self._cloud_signature()
@@ -394,30 +480,76 @@ class Window(WindowEvents):
             curr_frame.frame_id != self._last_curr_frame_id
             or (self._render_counter % refresh_interval) == 0
         )
-        if should_refresh_curr:
+
+        curr_id = int(curr_frame.frame_id)
+        is_new_frame = curr_id != self._last_fused_frame_id
+        need_curr_cloud = is_new_frame or should_refresh_curr
+
+        pts = None
+        rgb = None
+        if need_curr_cloud:
             pts, rgb = self._frame_world_cloud_np(curr_frame)
+
+        # Persist every new tracking frame into the stable world map.
+        if is_new_frame:
+            self._append_to_kf_cache(pts, rgb)
+            self._push_recent_cloud(curr_id, pts, rgb)
+            self._last_fused_frame_id = curr_id
+
+        keep = max(1, int(self.state.recent_frame_keep))
+        if len(self._recent_clouds) > keep:
+            self._recent_clouds = self._recent_clouds[-keep:]
+
+        if should_refresh_curr:
             self._curr_points = np.zeros((0, 3), dtype=np.float32) if pts is None else pts
             self._curr_colors = np.zeros((0, 3), dtype=np.float32) if rgb is None else rgb
-            self._last_curr_frame_id = int(curr_frame.frame_id)
+            self._last_curr_frame_id = curr_id
 
     def _compose_render_cloud(self):
-        parts_p = []
-        parts_c = []
+        kf_points = None
+        kf_colors = None
+        kf_weights = None
         if self._kf_points.shape[0] > 0:
-            parts_p.append(self._kf_points)
-            parts_c.append(self._kf_colors)
-        if self._curr_points.shape[0] > 0:
-            parts_p.append(self._curr_points)
-            parts_c.append(self._curr_colors)
+            min_support = max(1, int(self.state.kf_min_support))
+            if min_support <= 1:
+                kf_mask = np.ones_like(self._kf_weights, dtype=bool)
+            else:
+                kf_mask = self._kf_weights >= float(min_support)
+                # Avoid aggressive filtering that makes the map collapse to a tiny region.
+                if np.sum(kf_mask) < max(1000, int(0.15 * self._kf_weights.shape[0])):
+                    kf_mask = np.ones_like(self._kf_weights, dtype=bool)
+            kf_points = self._kf_points[kf_mask]
+            kf_colors = self._kf_colors[kf_mask]
+            kf_weights = self._kf_weights[kf_mask]
 
-        if not parts_p:
+        recent_points = None
+        recent_colors = None
+        if self._recent_clouds:
+            recent_points = np.concatenate([x[1] for x in self._recent_clouds], axis=0)
+            recent_colors = np.concatenate([x[2] for x in self._recent_clouds], axis=0)
+        elif self._curr_points.shape[0] > 0:
+            recent_points = self._curr_points
+            recent_colors = self._curr_colors
+
+        if kf_points is None and recent_points is None:
             self._active_render_points = 0
             return None, None
 
-        points = np.concatenate(parts_p, axis=0)
-        colors = np.concatenate(parts_c, axis=0)
         max_points = max(20000, int(self.state.max_gaussians))
-        points, colors = self._cap_cloud_np(points, colors, max_points)
+        if recent_points is not None and recent_points.shape[0] >= max_points:
+            points, colors, _ = self._cap_cloud_np(recent_points, recent_colors, max_points, None)
+        elif recent_points is not None and kf_points is not None:
+            remain = max_points - recent_points.shape[0]
+            kf_points, kf_colors, _ = self._cap_cloud_np(
+                kf_points, kf_colors, max(1, remain), kf_weights
+            )
+            points = np.concatenate([kf_points, recent_points], axis=0)
+            colors = np.concatenate([kf_colors, recent_colors], axis=0)
+        elif kf_points is not None:
+            points, colors, _ = self._cap_cloud_np(kf_points, kf_colors, max_points, kf_weights)
+        else:
+            points, colors, _ = self._cap_cloud_np(recent_points, recent_colors, max_points, None)
+
         self._active_render_points = int(points.shape[0])
         return points, colors
 
@@ -427,7 +559,7 @@ class Window(WindowEvents):
             if self.gs_tex is not None:
                 self.gs_tex.release()
             self.gs_tex = self.ctx.texture((w, h), 3, dtype="f4")
-            self.gs_tex.filter = (moderngl.LINEAR, moderngl.LINEAR)
+            self.gs_tex.filter = (moderngl.NEAREST, moderngl.NEAREST)
 
         if self.gs_depth_tex is None or self.gs_depth_tex.size != (w, h):
             if self.gs_depth_tex is not None:
@@ -487,7 +619,7 @@ class Window(WindowEvents):
             return None
 
         view_w, view_h = self.viewport.screen.size
-        scale = float(np.clip(self.state.render_resolution_scale, 0.2, 1.0))
+        scale = float(np.clip(self.state.render_resolution_scale, 0.2, 2.0))
         w = max(32, int(view_w * scale))
         h = max(32, int(view_h * scale))
 
@@ -558,8 +690,8 @@ def run_visualization(
     keyframes,
     main2viz,
     viz2main,
-    init_spatial_stride=4,
-    init_max_gaussians=4 * 1024 * 1024,
+    init_spatial_stride=1,
+    init_max_gaussians=6 * 1024 * 1024,
 ) -> None:
     set_global_config(cfg)
 
