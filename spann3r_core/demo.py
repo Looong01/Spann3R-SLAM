@@ -17,7 +17,7 @@ from dust3r.image_pairs import make_pairs
 from dust3r.utils.image import imread_cv2
 from dust3r.post_process import estimate_focal_knowing_depth
 
-from spann3r.datasets import *
+from spann3r.spann3r_data import *
 from spann3r.model import Spann3R
 from spann3r.loss import Regr3D_t_ScaleShiftInv
 from spann3r.tools.eval_recon import accuracy, completion

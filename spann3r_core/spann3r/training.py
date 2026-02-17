@@ -21,7 +21,7 @@ from torch.utils.tensorboard import SummaryWriter
 
 from spann3r.model import Spann3R
 from dust3r.losses import L21
-from spann3r.datasets import *
+from spann3r.spann3r_data import *
 from spann3r.loss import Regr3D_t, ConfLoss_t, Regr3D_t_ScaleShiftInv
 from croco.utils.misc import NativeScalerWithGradNormCount as NativeScaler
 

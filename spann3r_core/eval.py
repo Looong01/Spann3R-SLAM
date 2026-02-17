@@ -11,7 +11,7 @@ from dust3r.inference import inference
 from dust3r.utils.geometry import geotrf
 from dust3r.image_pairs import make_pairs
 from spann3r.loss import Regr3D_t_ScaleShiftInv
-from spann3r.datasets import *
+from spann3r.spann3r_data import *
 from torch.utils.data import DataLoader
 from spann3r.tools.eval_recon import accuracy, completion
 

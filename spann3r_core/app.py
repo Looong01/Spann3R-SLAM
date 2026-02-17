@@ -8,7 +8,7 @@ import tempfile
 import subprocess
 from dust3r.losses import L21
 from spann3r.model import Spann3R
-from spann3r.datasets import Demo
+from spann3r.spann3r_data import Demo
 from torch.utils.data import DataLoader
 import trimesh
 from scipy.spatial.transform import Rotation
